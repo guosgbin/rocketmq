@@ -114,6 +114,7 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
             }
         });
 
+        // 这个是在eventLoopGroupBoss在接受到连接的时候，它负责将建立好连接的socket注册到selector上去
         if (useEpoll()) {
             this.eventLoopGroupBoss = new EpollEventLoopGroup(1, new ThreadFactory() {
                 private AtomicInteger threadIndex = new AtomicInteger(0);
@@ -134,6 +135,7 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
                 }
             });
         } else {
+            // eventLoopGroupBoss负责监听 TCP网络连接请求
             this.eventLoopGroupBoss = new NioEventLoopGroup(1, new ThreadFactory() {
                 private AtomicInteger threadIndex = new AtomicInteger(0);
 
@@ -179,8 +181,15 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
             && Epoll.isAvailable();
     }
 
+    /**
+     * 在NettyRemotingServer实例初始化完成后，就会将其启动。
+     * Server端在启动阶段会将之前实例化好的1个acceptor线程（eventLoopGroupBoss）
+     * N个IO线程（eventLoopGroupSelector），M1个worker 线程（defaultEventExecutorGroup）绑定上去。
+     */
     @Override
     public void start() {
+        // 这里的Worker线程池是专门用于处理Netty网络通信相关的（包括编码/解码、空闲链接管理、网络连接管理以及网络请求处理）
+        // RocketMQ-> Java NIO的1+N+M模型：1个acceptor线程，N个IO线程，M1个worker 线程。
         this.defaultEventExecutorGroup = new DefaultEventExecutorGroup(
             nettyServerConfig.getServerWorkerThreads(),
             new ThreadFactory() {
@@ -195,6 +204,10 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
 
         prepareSharableHandlers();
 
+        /*
+         * Worker线程拿到网络数据后，就交给Netty的ChannelPipeline（其采用责任链设计模式）
+         * 从Head到Tail的一个个Handler执行下去，这些 Handler是在创建NettyRemotingServer实例时候指定的。
+         */
         ServerBootstrap childHandler =
             this.serverBootstrap.group(this.eventLoopGroupBoss, this.eventLoopGroupSelector)
                 .channel(useEpoll() ? EpollServerSocketChannel.class : NioServerSocketChannel.class)
@@ -206,15 +219,24 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
                 .childOption(ChannelOption.SO_RCVBUF, nettyServerConfig.getServerSocketRcvBufSize())
                 .localAddress(new InetSocketAddress(this.nettyServerConfig.getListenPort()))
                 .childHandler(new ChannelInitializer<SocketChannel>() {
+                    /*
+                     * NettyEncoder和NettyDecoder负责网络传输数据和 RemotingCommand 之间的编解码。
+                     * NettyServerHandler 拿到解码得到的 RemotingCommand 后，然后调度到channelRead0方法
+                     */
                     @Override
                     public void initChannel(SocketChannel ch) throws Exception {
                         ch.pipeline()
                             .addLast(defaultEventExecutorGroup, HANDSHAKE_HANDLER_NAME, handshakeHandler)
                             .addLast(defaultEventExecutorGroup,
+                                // rocketmq解码器,他们分别覆盖了父类的encode和decode方法
                                 encoder,
+                                // rocketmq编码器
                                 new NettyDecoder(),
+                                // Netty自带的心跳管理器
                                 new IdleStateHandler(0, 0, nettyServerConfig.getServerChannelMaxIdleTimeSeconds()),
+                                // 连接管理器，他负责捕获新连接、连接断开、异常等事件，然后统一调度到NettyEventExecuter处理器处理。
                                 connectionManageHandler,
+                                // 当一个消息经过前面的解码等步骤后，然后调度到channelRead0方法，然后根据消息类型进行分发
                                 serverHandler
                             );
                     }
@@ -414,9 +436,31 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
 
     @ChannelHandler.Sharable
     class NettyServerHandler extends SimpleChannelInboundHandler<RemotingCommand> {
-
+        /*
+         * NettyEncoder和NettyDecoder 负责网络传输数据和 RemotingCommand 之间的编解码。
+         * NettyServerHandler 拿到解码得到的 RemotingCommand 后，然后调度到channelRead0方法。
+         */
         @Override
         protected void channelRead0(ChannelHandlerContext ctx, RemotingCommand msg) throws Exception {
+            /*
+             * 根据 RemotingCommand.type 来判断是 request 还是 response来进行相应处理
+             * 根据业务请求码封装成不同的task任务后，提交给对应的业务processor处理线程池处理M2。
+             *
+             *  https://img-blog.csdnimg.cn/2018121412005376.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L01ha2VDb250cmFs,size_16,color_FFFFFF,t_70
+             *
+             * 一个 Reactor 主线程负责监听 TCP 连接请求，建立好连接后丢给 Reactor 线程池，
+             * 它负责将建立好连接的 socket 注册到 selector 上去（这里有两种方式，NIO和Epoll，可配置），
+             * 然后监听真正的网络数据。拿到网络数据后，再丢给 Worker 线程池。
+             * Worker 拿到网络数据后，就交给 Pipeline，从 Head 到 Tail 一个个 Handler 的走下去，
+             * 这些 Handler 是在创建 Server 的时候指定的。NettyEncoder 和 NettyDecoder 负责网络数据和 RemotingCommand 之间的编解码。
+             * NettyServerHandler 拿到解码得到的 RemotingCommand 后，根据 RemotingCommand.type 来判断是 request 还是 response，
+             * 如果是 request, 就根据 RomotingCommand 的 code(code用来标识不同类型的请求) 去 processorTable 找到对应的 processor,
+             * 然后封装成 task 后，丢给对应的 processor 线程池,
+             *  如果是 response 就根据RemotingCommand.opaque 去 responseTable 中拿到对应的 ResponseFuture,把结果 set 给它。
+             * 对于 Client，经过 Pipeline 的顺序是从 Tail 到 Head。
+             * 不管是 Server 和 Client，并不是每次数据流转都得经过所有的 Handler，而是会根据 Context 中的一些信息去判断。
+             * 整个数据流转过程中还有很多hook, 比如处理 command 前，处理 command 后，发送数据前，发送数据后等。
+             */
             processMessageReceived(ctx, msg);
         }
     }

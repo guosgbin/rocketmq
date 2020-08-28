@@ -23,9 +23,14 @@ import java.util.List;
 import java.util.Random;
 import org.apache.rocketmq.common.MixAll;
 
+/**
+ * Master与Slave 的对应关系通过指定相同的BrokerName，不同的BrokerId来定义
+ * BrokerId为0 表示Master，非0 表示Slave。
+ */
 public class BrokerData implements Comparable<BrokerData> {
     private String cluster;
     private String brokerName;
+    //同一个brokerName下可以有一个Master和多个Slave,所以brokerAddrs是一个集合
     private HashMap<Long/* brokerId */, String/* broker address */> brokerAddrs;
 
     private final Random random = new Random();

@@ -41,18 +41,26 @@ import org.apache.rocketmq.srvutil.FileWatchService;
 
 public class NamesrvController {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.NAMESRV_LOGGER_NAME);
-
+    // Name Server配置
     private final NamesrvConfig namesrvConfig;
-
+    // Netty配置
     private final NettyServerConfig nettyServerConfig;
 
     private final ScheduledExecutorService scheduledExecutorService = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryImpl(
         "NSScheduledThread"));
+    /*
+     * 1.加载namesrvController指定的kvConfig配置文件(常为xxx/kvConfig.json)到内存进行读取、增加、删除kvConfig记录。
+     * 2.将内存记录的配置,持久化到文件
+     * 3.打印所有kvConfig配置
+     */
     private final KVConfigManager kvConfigManager;
+    /*
+     * 路由信息管理,保存了整个消息集群的相关信息
+     */
     private final RouteInfoManager routeInfoManager;
 
     private RemotingServer remotingServer;
-
+    // Broker连接事件处理服务
     private BrokerHousekeepingService brokerHousekeepingService;
 
     private ExecutorService remotingExecutor;
@@ -74,18 +82,22 @@ public class NamesrvController {
     }
 
     public boolean initialize() {
-
+        // 加载KV配置
         this.kvConfigManager.load();
-
+        // 初始化通信层
         this.remotingServer = new NettyRemotingServer(this.nettyServerConfig, this.brokerHousekeepingService);
-
+        // 初始化线程池（根据getServerWorkerThreads值，启动相应数量线程）
         this.remotingExecutor =
             Executors.newFixedThreadPool(nettyServerConfig.getServerWorkerThreads(), new ThreadFactoryImpl("RemotingExecutorThread_"));
-
+        // 此注册函数主要作用就是，定义RequestCode，用来作为netty的通信协议字段
+        // 即：如果broker通过netty发送通信请求，其中请求信息中带有code == RequestCode.REGISTER_BROKER，
+        // 那么在namesrv的netty端接收到该通信连接时候，则对应调用namesrv的DefaultRequestProcessor类下面的registerBroker方法，
+        // 从而完成broker向namesrv注册
+        // 具体请参考com.alibaba.rocketmq.namesrv.processor.DefaultRequestProcessor类
         this.registerProcessor();
-
+        // 增加定时任务（延时5秒，每间隔10s钟，定时扫描一次）
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
-
+            // 定时扫描notActive的broker,也就是不活跃的broker
             @Override
             public void run() {
                 NamesrvController.this.routeInfoManager.scanNotActiveBroker();
@@ -93,7 +105,7 @@ public class NamesrvController {
         }, 5, 10, TimeUnit.SECONDS);
 
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
-
+            // 定时将configTable相关信息记录到日志文件中
             @Override
             public void run() {
                 NamesrvController.this.kvConfigManager.printAllPeriodically();
